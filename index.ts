@@ -23,21 +23,20 @@ if (existsSync(envPath)) {
 
 // Configuration
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
-const GROQ_BASE_URL = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
-const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
 const DATA_DIR = process.env.DATA_DIR || join(__dirname, 'data');
 const LOG_FILE = join(__dirname, 'bot.log');
 const LEARNING_FILE = join(DATA_DIR, 'learning.json');
 
 // Check required tokens
 if (!TELEGRAM_TOKEN) {
-  console.error('❌ TELEGRAM_TOKEN not set! Create .env file with your token.');
+  console.error('❌ TELEGRAM_TOKEN not set!');
   process.exit(1);
 }
-if (!GROQ_API_KEY) {
-  console.error('❌ GROQ_API_KEY not set!');
-  console.error('Get your FREE key at: https://console.groq.com');
+if (!GEMINI_API_KEY) {
+  console.error('❌ GEMINI_API_KEY not set!');
+  console.error('Get FREE key at: https://aistudio.google.com/apikey');
   process.exit(1);
 }
 
@@ -180,31 +179,37 @@ async function sendDocument(chatId: number, content: string, filename: string): 
   }
 }
 
-// ==================== GROQ API ====================
-async function groqChat(messages: Array<{role: string; content: string}>): Promise<string> {
+// ==================== GEMINI API ====================
+async function geminiChat(messages: Array<{role: string; content: string}>): Promise<string> {
   try {
-    const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
+    // Convert to Gemini format
+    const contents = messages.map(m => ({
+      role: m.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: m.content }]
+    }));
+    
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
+    
+    const res = await fetch(url, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages,
-        temperature: 0.7,
-        max_tokens: 4096
+        contents,
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 8192
+        }
       })
     });
     
     const data = await res.json();
     if (data.error) {
-      log('ERROR', 'Groq error', data.error);
+      log('ERROR', 'Gemini error', data.error);
       return '';
     }
-    return data.choices?.[0]?.message?.content || '';
+    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
   } catch (e) {
-    log('ERROR', 'Groq request error', e);
+    log('ERROR', 'Gemini request error', e);
     return '';
   }
 }
@@ -229,7 +234,6 @@ async function readPage(url: string): Promise<string> {
     
     const html = await res.text();
     
-    // Extract text from HTML
     const text = html
       .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
       .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
@@ -257,15 +261,17 @@ async function analyzeTask(content: string): Promise<{ canDo: boolean; reason: s
   const knownIssues = getCommonIssues('all');
   const issuesHint = knownIssues.length > 0 ? `\n\nИзвестные частые проблемы для избежания:\n${knownIssues.slice(0, 5).join('\n')}` : '';
   
-  const response = await groqChat([
+  const response = await geminiChat([
     { 
-      role: 'system', 
+      role: 'user', 
       content: `Ты — эксперт по фрилансу. Проанализируй задание.
 
 Формат JSON:
-{"canDo": true/false, "reason": "причина", "taskType": "python_script|web_parser|telegram_bot|web_app|api_integration|other", "requirements": ["требование 1", ...]}${issuesHint}` 
-    },
-    { role: 'user', content: `ЗАДАНИЕ:\n${content.substring(0, 10000)}` }
+{"canDo": true/false, "reason": "причина", "taskType": "python_script|web_parser|telegram_bot|web_app|api_integration|other", "requirements": ["требование 1", ...]}${issuesHint}
+
+ЗАДАНИЕ:
+${content.substring(0, 10000)}`
+    }
   ]);
   
   try {
@@ -308,9 +314,9 @@ async function generateCode(
     ? `\n\nИЗБЕГАЙ ЭТИХ ЧАСТЫХ ОШИБОК:\n${commonIssues.map((i, idx) => `${idx+1}. ${i}`).join('\n')}`
     : '';
 
-  return await groqChat([
+  return await geminiChat([
     { 
-      role: 'system', 
+      role: 'user', 
       content: `Ты — Senior Python Developer. Пиши КАЧЕСТВЕННЫЙ, РАБОЧИЙ код.
 
 КРИТИЧЕСКИ ВАЖНО:
@@ -343,11 +349,14 @@ if __name__ == "__main__":
     main()
 \`\`\`
 
-Максимум 200 строк. Код должен запускаться БЕЗ ошибок!${avoidHint}${exampleHint}` 
-    },
-    { 
-      role: 'user', 
-      content: `Тип: ${typePrompts[taskType] || 'Python'}${reqList}\n\nЗАДАНИЕ:\n${taskContent.substring(0, 10000)}\n\nНапиши полный рабочий код.` 
+Максимум 200 строк. Код должен запускаться БЕЗ ошибок!${avoidHint}${exampleHint}
+
+Тип: ${typePrompts[taskType] || 'Python'}${reqList}
+
+ЗАДАНИЕ:
+${taskContent.substring(0, 10000)}
+
+Напиши полный рабочий код.`
     }
   ]);
 }
@@ -360,9 +369,9 @@ interface ReviewResult {
 }
 
 async function reviewCode(code: string, taskContent: string, requirements: string[]): Promise<ReviewResult> {
-  const response = await groqChat([
+  const response = await geminiChat([
     { 
-      role: 'system', 
+      role: 'user', 
       content: `Ты — QA Engineer. Проверь код на РАБОТОСПОСОБНОСТЬ.
 
 ПРОВЕРЬ КАЖДОЕ:
@@ -382,11 +391,18 @@ async function reviewCode(code: string, taskContent: string, requirements: strin
   "score": 7,
   "issues": ["проблема 1", "проблема 2"],
   "criticalIssues": ["критическая проблема которая сломает запуск"]
-}` 
-    },
-    { 
-      role: 'user', 
-      content: `ЗАДАНИЕ:\n${taskContent.substring(0, 2000)}\n\nТРЕБОВАНИЯ:\n${requirements.join('\n') || 'Стандартные'}\n\nКОД:\n${code.substring(0, 15000)}\n\nПроверь и оцени.` 
+}
+
+ЗАДАНИЕ:
+${taskContent.substring(0, 2000)}
+
+ТРЕБОВАНИЯ:
+${requirements.join('\n') || 'Стандартные'}
+
+КОД:
+${code.substring(0, 15000)}
+
+Проверь и оцени.`
     }
   ]);
 
@@ -422,9 +438,9 @@ async function fixCode(
     ? `\n\nИСТОРИЯ ПОПЫТОК:\n${previousAttempts.map((a, i) => `Попытка ${i+1}: ${a.score}/10, критических: ${a.criticalIssues.length}`).join('\n')}`
     : '';
   
-  return await groqChat([
+  return await geminiChat([
     { 
-      role: 'system', 
+      role: 'user', 
       content: `Ты — Senior Python Developer. ИСПРАВЬ код.
 
 КРИТИЧНО:
@@ -445,11 +461,21 @@ async function fixCode(
 \`\`\`python
 # ИСПРАВЛЕННЫЙ код
 ...
-\`\`\`` 
-    },
-    { 
-      role: 'user', 
-      content: `ЗАДАНИЕ:\n${taskContent.substring(0, 1500)}\n\nПРОБЛЕМЫ:\n${problemsList}\n\nКОД:\n${code.substring(0, 15000)}\n\n---\nПопытка ${attempt}/${MAX_FIX_ATTEMPTS}${historyHint}\n\nИсправь проблемы и проверь что код целый.` 
+\`\`\`
+
+ЗАДАНИЕ:
+${taskContent.substring(0, 1500)}
+
+ПРОБЛЕМЫ:
+${problemsList}
+
+КОД:
+${code.substring(0, 15000)}
+
+---
+Попытка ${attempt}/${MAX_FIX_ATTEMPTS}${historyHint}
+
+Исправь проблемы и проверь что код целый.`
     }
   ]);
 }
@@ -614,7 +640,7 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
 
 // ==================== MAIN ====================
 async function main() {
-  log('INFO', '🤖 Freelance Bot v5.2 (Groq + Llama 3.1) starting...');
+  log('INFO', '🤖 Freelance Bot v5.3 (Google Gemini) starting...');
   
   const learning = loadLearning();
   log('INFO', `Learning data loaded`, { successes: learning.successes.length, failures: learning.failures.length });
@@ -651,8 +677,8 @@ async function main() {
             
             if (text === '/start') {
               await sendMessage(chat.id, `
-👋 <b>Freelance AI Bot v5.2</b>
-Powered by Groq (Llama 3.1 70B) 🚀
+👋 <b>Freelance AI Bot v5.3</b>
+Powered by Google Gemini ✨
 
 <b>Как работает:</b>
 1. Анализирую задание
