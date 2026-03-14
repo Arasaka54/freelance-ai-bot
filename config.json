@@ -1,0 +1,24 @@
+{
+  "version": "5.0",
+  "description": "Freelance AI Bot с системой обучения",
+  
+  "learning": {
+    "storage": "./data/learning.json",
+    "saveSuccess": true,
+    "saveFailures": true,
+    "maxHistory": 100
+  },
+  
+  "quality": {
+    "minScore": 7,
+    "maxFixAttempts": 5,
+    "usePreviousSolutions": true,
+    "checkSyntax": true
+  },
+  
+  "features": {
+    "syntaxCheck": "python3 -m py_compile",
+    "saveCodeHistory": true,
+    "compareWithPrevious": true
+  }
+}

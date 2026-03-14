@@ -1,0 +1,23 @@
+# Environment
+.env
+
+# Dependencies
+node_modules/
+
+# Data (optional - uncomment if you don't want to sync learning data)
+# data/
+
+# Logs
+*.log
+output.log
+bot.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
