@@ -1,10 +1,8 @@
-import ZAI from 'z-ai-web-dev-sdk';
 import { appendFileSync, readFileSync, existsSync, mkdirSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
 // ==================== CONFIG ====================
-// Get directory of current file
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
@@ -23,18 +21,25 @@ if (existsSync(envPath)) {
   });
 }
 
-// Token from environment variable or .env file
+// Configuration from environment
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
 const DATA_DIR = process.env.DATA_DIR || join(__dirname, 'data');
 const LOG_FILE = join(__dirname, 'bot.log');
 const LEARNING_FILE = join(DATA_DIR, 'learning.json');
 
-// Check token
+// Check required tokens
 if (!TELEGRAM_TOKEN) {
   console.error('❌ TELEGRAM_TOKEN not set! Create .env file with your token.');
-  console.error('Example: TELEGRAM_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz');
   process.exit(1);
 }
+if (!OPENAI_API_KEY) {
+  console.error('❌ OPENAI_API_KEY not set! Create .env file with your API key.');
+  console.error('Get your key at: https://platform.openai.com/api-keys');
+  process.exit(1);
+}
+
 const MAX_FIX_ATTEMPTS = 5;
 const MIN_SCORE = 7;
 
@@ -91,15 +96,12 @@ function addLearningEntry(entry: LearningEntry) {
   
   if (entry.success) {
     data.successes.push(entry);
-    // Храним только последние 50 успешных
     if (data.successes.length > 50) data.successes = data.successes.slice(-50);
   } else {
     data.failures.push(entry);
-    // Храним только последние 30 неудач
     if (data.failures.length > 30) data.failures = data.failures.slice(-30);
   }
   
-  // Извлекаем паттерны
   if (!data.patterns[entry.taskType]) {
     data.patterns[entry.taskType] = [];
   }
@@ -113,38 +115,29 @@ function addLearningEntry(entry: LearningEntry) {
 
 function getSimilarSuccess(taskType: string, description: string): LearningEntry | null {
   const data = loadLearning();
-  
-  // Ищем похожее успешное решение
   const descWords = description.toLowerCase().split(/\s+/).filter(w => w.length > 3);
   
   for (const entry of [...data.successes].reverse()) {
     if (entry.taskType === taskType) {
       const entryWords = entry.description.toLowerCase().split(/\s+/).filter(w => w.length > 3);
       const commonWords = descWords.filter(w => entryWords.includes(w));
-      
-      // Если есть 3+ общих слова - похоже
       if (commonWords.length >= 3) {
         log('INFO', `Found similar success`, { commonWords: commonWords.slice(0, 5) });
         return entry;
       }
     }
   }
-  
   return null;
 }
 
 function getCommonIssues(taskType: string): string[] {
   const data = loadLearning();
   const issues: string[] = [];
-  
-  // Собираем частые проблемы из неудач
   for (const entry of data.failures) {
     if (entry.taskType === taskType) {
       issues.push(...entry.issues);
     }
   }
-  
-  // Возвращаем уникальные
   return [...new Set(issues)].slice(0, 10);
 }
 
@@ -186,29 +179,72 @@ async function sendDocument(chatId: number, content: string, filename: string): 
   }
 }
 
-// ==================== ZAI INSTANCE ====================
-let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null;
-async function getZAI() {
-  if (!zaiInstance) zaiInstance = await ZAI.create();
-  return zaiInstance;
+// ==================== OPENAI API ====================
+async function openaiChat(messages: Array<{role: string; content: string}>): Promise<string> {
+  try {
+    const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        messages,
+        temperature: 0.7,
+        max_tokens: 4096
+      })
+    });
+    
+    const data = await res.json();
+    if (data.error) {
+      log('ERROR', 'OpenAI error', data.error);
+      return '';
+    }
+    return data.choices?.[0]?.message?.content || '';
+  } catch (e) {
+    log('ERROR', 'OpenAI request error', e);
+    return '';
+  }
 }
 
 // ==================== PAGE READER ====================
 async function readPage(url: string): Promise<string> {
   try {
-    const zai = await getZAI();
-    const result = await zai.functions.invoke('page_reader', { url });
-    if (result.code === 200 && result.data?.html) {
-      const text = result.data.html
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<[^>]*>/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-      log('INFO', `Page read: ${text.length} chars`);
-      return text.substring(0, 25000);
+    log('INFO', `Fetching page: ${url}`);
+    
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
+      }
+    });
+    
+    if (!res.ok) {
+      log('ERROR', `Page fetch failed: ${res.status}`);
+      return '';
     }
-    return '';
+    
+    const html = await res.text();
+    
+    // Extract text from HTML
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/\s+/g, ' ')
+      .trim();
+    
+    log('INFO', `Page read: ${text.length} chars`);
+    return text.substring(0, 25000);
   } catch (e) {
     log('ERROR', 'Page reader error', e);
     return '';
@@ -217,28 +253,22 @@ async function readPage(url: string): Promise<string> {
 
 // ==================== ANALYZE TASK ====================
 async function analyzeTask(content: string): Promise<{ canDo: boolean; reason: string; taskType: string; requirements: string[] }> {
-  const zai = await getZAI();
-  
-  // Получаем известные проблемы для этого типа
   const knownIssues = getCommonIssues('all');
   const issuesHint = knownIssues.length > 0 ? `\n\nИзвестные частые проблемы для избежания:\n${knownIssues.slice(0, 5).join('\n')}` : '';
   
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { 
-        role: 'assistant', 
-        content: `Ты — эксперт по фрилансу. Проанализируй задание.
+  const response = await openaiChat([
+    { 
+      role: 'system', 
+      content: `Ты — эксперт по фрилансу. Проанализируй задание.
 
 Формат JSON:
 {"canDo": true/false, "reason": "причина", "taskType": "python_script|web_parser|telegram_bot|web_app|api_integration|other", "requirements": ["требование 1", ...]}${issuesHint}` 
-      },
-      { role: 'user', content: `ЗАДАНИЕ:\n${content.substring(0, 10000)}` }
-    ],
-    thinking: { type: 'enabled' }
-  });
+    },
+    { role: 'user', content: `ЗАДАНИЕ:\n${content.substring(0, 10000)}` }
+  ]);
   
   try {
-    const match = (completion.choices[0]?.message?.content || '').match(/\{[\s\S]*\}/);
+    const match = response.match(/\{[\s\S]*\}/);
     if (match) {
       const p = JSON.parse(match[0]);
       return { canDo: p.canDo ?? true, reason: p.reason ?? '', taskType: p.taskType ?? 'other', requirements: p.requirements ?? [] };
@@ -254,8 +284,6 @@ async function generateCode(
   requirements: string[],
   similarSuccess?: LearningEntry | null
 ): Promise<string> {
-  const zai = await getZAI();
-  
   const typePrompts: Record<string, string> = {
     python_script: 'Python скрипт с argparse',
     web_parser: 'Python парсер (requests + BeautifulSoup)',
@@ -269,23 +297,20 @@ async function generateCode(
     ? `\n\nОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:\n${requirements.map((r, i) => `${i+1}. ${r}`).join('\n')}` 
     : '';
   
-  // Если есть похожее успешное решение - используем как пример
   let exampleHint = '';
   if (similarSuccess) {
     exampleHint = `\n\nПРИМЕР УСПЕШНОГО ПОХОЖЕГО РЕШЕНИЯ (адаптируй под текущую задачу):\n${similarSuccess.code.substring(0, 2000)}`;
   }
   
-  // Получаем частые проблемы для избежания
   const commonIssues = getCommonIssues(taskType);
   const avoidHint = commonIssues.length > 0 
     ? `\n\nИЗБЕГАЙ ЭТИХ ЧАСТЫХ ОШИБОК:\n${commonIssues.map((i, idx) => `${idx+1}. ${i}`).join('\n')}`
     : '';
 
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { 
-        role: 'assistant', 
-        content: `Ты — Senior Python Developer. Пиши КАЧЕСТВЕННЫЙ, РАБОЧИЙ код.
+  return await openaiChat([
+    { 
+      role: 'system', 
+      content: `Ты — Senior Python Developer. Пиши КАЧЕСТВЕННЫЙ, РАБОЧИЙ код.
 
 КРИТИЧЕСКИ ВАЖНО:
 1. Каждый файл ПОЛНОСТЬЮ — никаких обрывов!
@@ -302,8 +327,6 @@ async function generateCode(
 """Описание модуля"""
 import logging
 from typing import Optional, List, Dict
-import requests  # если нужно
-from bs4 import BeautifulSoup  # если нужно
 
 logger = logging.getLogger(__name__)
 
@@ -320,16 +343,12 @@ if __name__ == "__main__":
 \`\`\`
 
 Максимум 200 строк. Код должен запускаться БЕЗ ошибок!${avoidHint}${exampleHint}` 
-      },
-      { 
-        role: 'user', 
-        content: `Тип: ${typePrompts[taskType] || 'Python'}${reqList}\n\nЗАДАНИЕ:\n${taskContent.substring(0, 10000)}\n\nНапиши полный рабочий код.` 
-      }
-    ],
-    thinking: { type: 'enabled' }
-  });
-  
-  return completion.choices[0]?.message?.content || '';
+    },
+    { 
+      role: 'user', 
+      content: `Тип: ${typePrompts[taskType] || 'Python'}${reqList}\n\nЗАДАНИЕ:\n${taskContent.substring(0, 10000)}\n\nНапиши полный рабочий код.` 
+    }
+  ]);
 }
 
 // ==================== REVIEW CODE ====================
@@ -340,13 +359,10 @@ interface ReviewResult {
 }
 
 async function reviewCode(code: string, taskContent: string, requirements: string[]): Promise<ReviewResult> {
-  const zai = await getZAI();
-  
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { 
-        role: 'assistant', 
-        content: `Ты — QA Engineer. Проверь код на РАБОТОСПОСОБНОСТЬ.
+  const response = await openaiChat([
+    { 
+      role: 'system', 
+      content: `Ты — QA Engineer. Проверь код на РАБОТОСПОСОБНОСТЬ.
 
 ПРОВЕРЬ КАЖДОЕ:
 1. Полнота — функции дописаны? скобки закрыты? return есть?
@@ -366,17 +382,15 @@ async function reviewCode(code: string, taskContent: string, requirements: strin
   "issues": ["проблема 1", "проблема 2"],
   "criticalIssues": ["критическая проблема которая сломает запуск"]
 }` 
-      },
-      { 
-        role: 'user', 
-        content: `ЗАДАНИЕ:\n${taskContent.substring(0, 2000)}\n\nТРЕБОВАНИЯ:\n${requirements.join('\n') || 'Стандартные'}\n\nКОД:\n${code.substring(0, 15000)}\n\nПроверь и оцени.` 
-      }
-    ],
-    thinking: { type: 'enabled' }
-  });
+    },
+    { 
+      role: 'user', 
+      content: `ЗАДАНИЕ:\n${taskContent.substring(0, 2000)}\n\nТРЕБОВАНИЯ:\n${requirements.join('\n') || 'Стандартные'}\n\nКОД:\n${code.substring(0, 15000)}\n\nПроверь и оцени.` 
+    }
+  ]);
 
   try {
-    const match = (completion.choices[0]?.message?.content || '').match(/\{[\s\S]*\}/);
+    const match = response.match(/\{[\s\S]*\}/);
     if (match) {
       const p = JSON.parse(match[0]);
       return { 
@@ -400,21 +414,17 @@ async function fixCode(
   attempt: number,
   previousAttempts: ReviewResult[]
 ): Promise<string> {
-  const zai = await getZAI();
-  
   const allProblems = [...criticalIssues, ...issues].slice(0, 10);
   const problemsList = allProblems.map((p, i) => `${i+1}. ${p}`).join('\n');
   
-  // Показываем историю попыток
   const historyHint = previousAttempts.length > 0
     ? `\n\nИСТОРИЯ ПОПЫТОК:\n${previousAttempts.map((a, i) => `Попытка ${i+1}: ${a.score}/10, критических: ${a.criticalIssues.length}`).join('\n')}`
     : '';
   
-  const completion = await zai.chat.completions.create({
-    messages: [
-      { 
-        role: 'assistant', 
-        content: `Ты — Senior Python Developer. ИСПРАВЬ код.
+  return await openaiChat([
+    { 
+      role: 'system', 
+      content: `Ты — Senior Python Developer. ИСПРАВЬ код.
 
 КРИТИЧНО:
 1. Сохрани структуру кода
@@ -435,16 +445,12 @@ async function fixCode(
 # ИСПРАВЛЕННЫЙ код
 ...
 \`\`\`` 
-      },
-      { 
-        role: 'user', 
-        content: `ЗАДАНИЕ:\n${taskContent.substring(0, 1500)}\n\nПРОБЛЕМЫ:\n${problemsList}\n\nКОД:\n${code.substring(0, 15000)}\n\n---\nПопытка ${attempt}/${MAX_FIX_ATTEMPTS}${historyHint}\n\nИсправь проблемы и проверь что код целый.` 
-      }
-    ],
-    thinking: { type: 'enabled' }
-  });
-  
-  return completion.choices[0]?.message?.content || '';
+    },
+    { 
+      role: 'user', 
+      content: `ЗАДАНИЕ:\n${taskContent.substring(0, 1500)}\n\nПРОБЛЕМЫ:\n${problemsList}\n\nКОД:\n${code.substring(0, 15000)}\n\n---\nПопытка ${attempt}/${MAX_FIX_ATTEMPTS}${historyHint}\n\nИсправь проблемы и проверь что код целый.` 
+    }
+  ]);
 }
 
 // ==================== EXTRACT FILES ====================
@@ -484,7 +490,6 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
   
   let content = urlOrContent;
   
-  // 1. Читаем страницу
   if (isUrl) {
     await sendMessage(chatId, '📖 <b>Читаю задание...</b>');
     content = await readPage(urlOrContent);
@@ -494,7 +499,6 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
     }
   }
   
-  // 2. Анализируем
   await sendMessage(chatId, '🔍 <b>Анализирую...</b>');
   const analysis = await analyzeTask(content);
   log('INFO', `Analyzed`, { canDo: analysis.canDo, type: analysis.taskType, reqs: analysis.requirements.length });
@@ -504,13 +508,11 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
     return;
   }
   
-  // 3. Ищем похожее успешное решение
   const similarSuccess = getSimilarSuccess(analysis.taskType, content);
   if (similarSuccess) {
     await sendMessage(chatId, '📚 <b>Нашёл похожее успешное решение</b> — адаптирую');
   }
   
-  // 4. Генерируем код
   await sendMessage(chatId, `🤖 <b>Генерирую код...</b> (${analysis.taskType})`);
   let code = await generateCode(content, analysis.taskType, analysis.requirements, similarSuccess);
   
@@ -519,7 +521,6 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
     return;
   }
   
-  // 5. Проверяем и исправляем
   let review = await reviewCode(code, content, analysis.requirements);
   const reviewHistory: ReviewResult[] = [];
   
@@ -550,14 +551,12 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
     
     await sendMessage(chatId, `📊 <b>Проверка: ${review.score}/10</b>${review.criticalIssues.length > 0 ? ` (${review.criticalIssues.length} критических)` : ''}`);
     
-    // Сохраняем лучший результат
     if (review.score > bestReview.score || 
         (review.score === bestReview.score && review.criticalIssues.length < bestReview.criticalIssues.length)) {
       bestCode = code;
       bestReview = review;
     }
     
-    // Останавливаемся если стало хуже
     if (review.score < bestReview.score - 2) {
       log('WARN', 'Score dropped significantly, reverting');
       code = bestCode;
@@ -565,7 +564,6 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
       break;
     }
     
-    // Останавливаемся если нет прогресса 2 попытки подряд
     if (attempt >= 2 && reviewHistory.length >= 2) {
       const last2 = reviewHistory.slice(-2);
       if (last2[0].score === review.score && last2[1].score === review.score) {
@@ -575,11 +573,9 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
     }
   }
   
-  // Используем лучший результат
   code = bestCode;
   review = bestReview;
   
-  // 6. Сохраняем в обучение
   const entry: LearningEntry = {
     id: taskId,
     taskType: analysis.taskType,
@@ -592,7 +588,6 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
   };
   addLearningEntry(entry);
   
-  // 7. Отправляем результат
   const emoji = review.score >= 9 ? '✅' : review.score >= 7 ? '👍' : '⚠️';
   await sendMessage(chatId, `${emoji} <b>Результат: ${review.score}/10</b>${attempt > 0 ? ` (${attempt} исправлений)` : ''}${review.score < MIN_SCORE ? '\n\n⚠️ Код требует доработки' : ''}`);
   
@@ -618,13 +613,11 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
 
 // ==================== MAIN ====================
 async function main() {
-  log('INFO', '🤖 Freelance Bot v5.0 with Learning starting...');
+  log('INFO', '🤖 Freelance Bot v5.1 (OpenAI) starting...');
   
-  // Загружаем данные обучения
   const learning = loadLearning();
   log('INFO', `Learning data loaded`, { successes: learning.successes.length, failures: learning.failures.length });
   
-  // Очищаем старые обновления
   let result = await tgApi('getUpdates', { timeout: 0 });
   let cleared = 0;
   while (result.ok && result.result?.length > 0) {
@@ -657,15 +650,15 @@ async function main() {
             
             if (text === '/start') {
               await sendMessage(chat.id, `
-👋 <b>Freelance AI Bot v5.0</b>
-С системой обучения!
+👋 <b>Freelance AI Bot v5.1</b>
+Powered by OpenAI GPT-4o-mini
 
 <b>Как работает:</b>
 1. Анализирую задание
 2. Генерирую код
 3. Проверяю качество
 4. Исправляю ошибки
-5. Сохраняю опыт для будущих задач
+5. Сохраняю опыт
 
 🧠 <b>Изучено задач:</b> ${learning.successes.length + learning.failures.length}
 ✅ <b>Успешных:</b> ${learning.successes.length}

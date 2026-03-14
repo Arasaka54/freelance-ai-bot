@@ -1,15 +1,13 @@
 {
   "name": "freelance-ai-bot",
-  "version": "5.0.0",
-  "description": "Telegram bot for freelance AI tasks with learning system",
+  "version": "5.1.0",
+  "description": "Telegram bot for freelance AI tasks with learning system (OpenAI powered)",
   "main": "index.ts",
   "scripts": {
     "start": "bun run index.ts",
     "dev": "bun --hot index.ts"
   },
-  "dependencies": {
-    "z-ai-web-dev-sdk": "latest"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/node": "^20.0.0",
     "typescript": "^5.0.0"
