@@ -21,10 +21,11 @@ if (existsSync(envPath)) {
   });
 }
 
-// Configuration from environment
+// Configuration
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';
+const GROQ_BASE_URL = process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.1-70b-versatile';
 const DATA_DIR = process.env.DATA_DIR || join(__dirname, 'data');
 const LOG_FILE = join(__dirname, 'bot.log');
 const LEARNING_FILE = join(DATA_DIR, 'learning.json');
@@ -34,9 +35,9 @@ if (!TELEGRAM_TOKEN) {
   console.error('❌ TELEGRAM_TOKEN not set! Create .env file with your token.');
   process.exit(1);
 }
-if (!OPENAI_API_KEY) {
-  console.error('❌ OPENAI_API_KEY not set! Create .env file with your API key.');
-  console.error('Get your key at: https://platform.openai.com/api-keys');
+if (!GROQ_API_KEY) {
+  console.error('❌ GROQ_API_KEY not set!');
+  console.error('Get your FREE key at: https://console.groq.com');
   process.exit(1);
 }
 
@@ -179,17 +180,17 @@ async function sendDocument(chatId: number, content: string, filename: string): 
   }
 }
 
-// ==================== OPENAI API ====================
-async function openaiChat(messages: Array<{role: string; content: string}>): Promise<string> {
+// ==================== GROQ API ====================
+async function groqChat(messages: Array<{role: string; content: string}>): Promise<string> {
   try {
-    const res = await fetch(`${OPENAI_BASE_URL}/chat/completions`, {
+    const res = await fetch(`${GROQ_BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`
+        'Authorization': `Bearer ${GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: GROQ_MODEL,
         messages,
         temperature: 0.7,
         max_tokens: 4096
@@ -198,12 +199,12 @@ async function openaiChat(messages: Array<{role: string; content: string}>): Pro
     
     const data = await res.json();
     if (data.error) {
-      log('ERROR', 'OpenAI error', data.error);
+      log('ERROR', 'Groq error', data.error);
       return '';
     }
     return data.choices?.[0]?.message?.content || '';
   } catch (e) {
-    log('ERROR', 'OpenAI request error', e);
+    log('ERROR', 'Groq request error', e);
     return '';
   }
 }
@@ -256,7 +257,7 @@ async function analyzeTask(content: string): Promise<{ canDo: boolean; reason: s
   const knownIssues = getCommonIssues('all');
   const issuesHint = knownIssues.length > 0 ? `\n\nИзвестные частые проблемы для избежания:\n${knownIssues.slice(0, 5).join('\n')}` : '';
   
-  const response = await openaiChat([
+  const response = await groqChat([
     { 
       role: 'system', 
       content: `Ты — эксперт по фрилансу. Проанализируй задание.
@@ -307,7 +308,7 @@ async function generateCode(
     ? `\n\nИЗБЕГАЙ ЭТИХ ЧАСТЫХ ОШИБОК:\n${commonIssues.map((i, idx) => `${idx+1}. ${i}`).join('\n')}`
     : '';
 
-  return await openaiChat([
+  return await groqChat([
     { 
       role: 'system', 
       content: `Ты — Senior Python Developer. Пиши КАЧЕСТВЕННЫЙ, РАБОЧИЙ код.
@@ -359,7 +360,7 @@ interface ReviewResult {
 }
 
 async function reviewCode(code: string, taskContent: string, requirements: string[]): Promise<ReviewResult> {
-  const response = await openaiChat([
+  const response = await groqChat([
     { 
       role: 'system', 
       content: `Ты — QA Engineer. Проверь код на РАБОТОСПОСОБНОСТЬ.
@@ -421,7 +422,7 @@ async function fixCode(
     ? `\n\nИСТОРИЯ ПОПЫТОК:\n${previousAttempts.map((a, i) => `Попытка ${i+1}: ${a.score}/10, критических: ${a.criticalIssues.length}`).join('\n')}`
     : '';
   
-  return await openaiChat([
+  return await groqChat([
     { 
       role: 'system', 
       content: `Ты — Senior Python Developer. ИСПРАВЬ код.
@@ -613,7 +614,7 @@ async function processTask(chatId: number, urlOrContent: string, isUrl: boolean)
 
 // ==================== MAIN ====================
 async function main() {
-  log('INFO', '🤖 Freelance Bot v5.1 (OpenAI) starting...');
+  log('INFO', '🤖 Freelance Bot v5.2 (Groq + Llama 3.1) starting...');
   
   const learning = loadLearning();
   log('INFO', `Learning data loaded`, { successes: learning.successes.length, failures: learning.failures.length });
@@ -650,8 +651,8 @@ async function main() {
             
             if (text === '/start') {
               await sendMessage(chat.id, `
-👋 <b>Freelance AI Bot v5.1</b>
-Powered by OpenAI GPT-4o-mini
+👋 <b>Freelance AI Bot v5.2</b>
+Powered by Groq (Llama 3.1 70B) 🚀
 
 <b>Как работает:</b>
 1. Анализирую задание
