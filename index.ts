@@ -23,8 +23,8 @@ if (existsSync(envPath)) {
 
 // Configuration
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || '';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+const AI_API_URL = process.env.AI_API_URL || 'https://zai.serizawa-team.com/api/ai';
+const AI_API_KEY = process.env.AI_API_KEY || 'freelance-bot-secret-2024';
 const DATA_DIR = process.env.DATA_DIR || join(__dirname, 'data');
 const LOG_FILE = join(__dirname, 'bot.log');
 const LEARNING_FILE = join(DATA_DIR, 'learning.json');
@@ -32,11 +32,6 @@ const LEARNING_FILE = join(DATA_DIR, 'learning.json');
 // Check required tokens
 if (!TELEGRAM_TOKEN) {
   console.error('❌ TELEGRAM_TOKEN not set!');
-  process.exit(1);
-}
-if (!GEMINI_API_KEY) {
-  console.error('❌ GEMINI_API_KEY not set!');
-  console.error('Get FREE key at: https://aistudio.google.com/apikey');
   process.exit(1);
 }
 
@@ -130,17 +125,6 @@ function getSimilarSuccess(taskType: string, description: string): LearningEntry
   return null;
 }
 
-function getCommonIssues(taskType: string): string[] {
-  const data = loadLearning();
-  const issues: string[] = [];
-  for (const entry of data.failures) {
-    if (entry.taskType === taskType) {
-      issues.push(...entry.issues);
-    }
-  }
-  return [...new Set(issues)].slice(0, 10);
-}
-
 // ==================== TELEGRAM API ====================
 const API_URL = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
@@ -179,305 +163,189 @@ async function sendDocument(chatId: number, content: string, filename: string): 
   }
 }
 
-// ==================== GEMINI API ====================
-async function geminiChat(messages: Array<{role: string; content: string}>): Promise<string> {
+// ==================== AI API CLIENT ====================
+async function aiRequest(action: string, data: any): Promise<any> {
   try {
-    // Convert to Gemini format
-    const contents = messages.map(m => ({
-      role: m.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: m.content }]
-    }));
-    
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-    
-    const res = await fetch(url, {
+    const res = await fetch(AI_API_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents,
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 8192
-        }
-      })
-    });
-    
-    const data = await res.json();
-    if (data.error) {
-      log('ERROR', 'Gemini error', data.error);
-      return '';
-    }
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-  } catch (e) {
-    log('ERROR', 'Gemini request error', e);
-    return '';
-  }
-}
-
-// ==================== PAGE READER ====================
-async function readPage(url: string): Promise<string> {
-  try {
-    log('INFO', `Fetching page: ${url}`);
-    
-    const res = await fetch(url, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en;q=0.8'
-      }
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${AI_API_KEY}`
+      },
+      body: JSON.stringify({ action, data })
     });
     
     if (!res.ok) {
-      log('ERROR', `Page fetch failed: ${res.status}`);
-      return '';
+      log('ERROR', `AI API error: ${res.status}`);
+      return null;
     }
     
-    const html = await res.text();
-    
-    const text = html
-      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
-      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
-      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&')
-      .replace(/\s+/g, ' ')
-      .trim();
-    
-    log('INFO', `Page read: ${text.length} chars`);
-    return text.substring(0, 25000);
+    return await res.json();
   } catch (e) {
-    log('ERROR', 'Page reader error', e);
-    return '';
+    log('ERROR', 'AI API request error', e);
+    return null;
   }
 }
 
-// ==================== ANALYZE TASK ====================
-async function analyzeTask(content: string): Promise<{ canDo: boolean; reason: string; taskType: string; requirements: string[] }> {
-  const knownIssues = getCommonIssues('all');
-  const issuesHint = knownIssues.length > 0 ? `\n\nИзвестные частые проблемы для избежания:\n${knownIssues.slice(0, 5).join('\n')}` : '';
+// ==================== PROCESS TASK ====================
+async function processTask(chatId: number, urlOrContent: string, isUrl: boolean) {
+  const startTime = Date.now();
+  const taskId = `task_${Date.now()}`;
+  log('INFO', `Task started`, { taskId, chatId, isUrl });
   
-  const response = await geminiChat([
-    { 
-      role: 'user', 
-      content: `Ты — эксперт по фрилансу. Проанализируй задание.
-
-Формат JSON:
-{"canDo": true/false, "reason": "причина", "taskType": "python_script|web_parser|telegram_bot|web_app|api_integration|other", "requirements": ["требование 1", ...]}${issuesHint}
-
-ЗАДАНИЕ:
-${content.substring(0, 10000)}`
+  let content = urlOrContent;
+  
+  // 1. Читаем страницу если URL
+  if (isUrl) {
+    await sendMessage(chatId, '📖 <b>Читаю задание...</b>');
+    const pageResult = await aiRequest('readpage', { url: urlOrContent });
+    if (!pageResult?.content) {
+      await sendMessage(chatId, '❌ Не удалось прочитать страницу');
+      return;
     }
-  ]);
+    content = pageResult.content;
+    log('INFO', `Page read: ${content.length} chars`);
+  }
   
-  try {
-    const match = response.match(/\{[\s\S]*\}/);
-    if (match) {
-      const p = JSON.parse(match[0]);
-      return { canDo: p.canDo ?? true, reason: p.reason ?? '', taskType: p.taskType ?? 'other', requirements: p.requirements ?? [] };
-    }
-  } catch {}
-  return { canDo: true, reason: '', taskType: 'other', requirements: [] };
-}
-
-// ==================== GENERATE CODE ====================
-async function generateCode(
-  taskContent: string, 
-  taskType: string, 
-  requirements: string[],
-  similarSuccess?: LearningEntry | null
-): Promise<string> {
-  const typePrompts: Record<string, string> = {
-    python_script: 'Python скрипт с argparse',
-    web_parser: 'Python парсер (requests + BeautifulSoup)',
-    telegram_bot: 'Telegram бот (python-telegram-bot или aiogram)',
-    web_app: 'Web приложение (Flask/FastAPI)',
-    api_integration: 'Python API клиент',
-    other: 'Python скрипт'
-  };
+  // 2. Анализируем
+  await sendMessage(chatId, '🔍 <b>Анализирую...</b>');
+  const analysis = await aiRequest('analyze', { content });
+  if (!analysis) {
+    await sendMessage(chatId, '❌ Ошибка анализа');
+    return;
+  }
   
-  const reqList = requirements.length > 0 
-    ? `\n\nОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:\n${requirements.map((r, i) => `${i+1}. ${r}`).join('\n')}` 
-    : '';
+  log('INFO', `Analyzed`, { canDo: analysis.canDo, type: analysis.taskType, reqs: analysis.requirements?.length });
   
-  let exampleHint = '';
+  if (!analysis.canDo) {
+    await sendMessage(chatId, `⚠️ Не могу выполнить: ${analysis.reason}`);
+    return;
+  }
+  
+  // 3. Ищем похожее успешное решение
+  const similarSuccess = getSimilarSuccess(analysis.taskType, content);
   if (similarSuccess) {
-    exampleHint = `\n\nПРИМЕР УСПЕШНОГО ПОХОЖЕГО РЕШЕНИЯ (адаптируй под текущую задачу):\n${similarSuccess.code.substring(0, 2000)}`;
+    await sendMessage(chatId, '📚 <b>Нашёл похожее успешное решение</b> — адаптирую');
   }
   
-  const commonIssues = getCommonIssues(taskType);
-  const avoidHint = commonIssues.length > 0 
-    ? `\n\nИЗБЕГАЙ ЭТИХ ЧАСТЫХ ОШИБОК:\n${commonIssues.map((i, idx) => `${idx+1}. ${i}`).join('\n')}`
-    : '';
-
-  return await geminiChat([
-    { 
-      role: 'user', 
-      content: `Ты — Senior Python Developer. Пиши КАЧЕСТВЕННЫЙ, РАБОЧИЙ код.
-
-КРИТИЧЕСКИ ВАЖНО:
-1. Каждый файл ПОЛНОСТЬЮ — никаких обрывов!
-2. Все функции и классы дописаны до конца
-3. try/except для ВСЕХ опасных операций
-4. Проверь баланс скобок (), [], {}
-5. Все импорты в начале файла
-6. Docstrings для функций
-7. Type hints
-
-ФОРМАТ:
-\`\`\`python
-# main.py
-"""Описание модуля"""
-import logging
-from typing import Optional, List, Dict
-
-logger = logging.getLogger(__name__)
-
-def main() -> None:
-    """Main function"""
-    try:
-        # code
-        pass
-    except Exception as e:
-        logger.error(f"Error: {e}")
-
-if __name__ == "__main__":
-    main()
-\`\`\`
-
-Максимум 200 строк. Код должен запускаться БЕЗ ошибок!${avoidHint}${exampleHint}
-
-Тип: ${typePrompts[taskType] || 'Python'}${reqList}
-
-ЗАДАНИЕ:
-${taskContent.substring(0, 10000)}
-
-Напиши полный рабочий код.`
-    }
-  ]);
-}
-
-// ==================== REVIEW CODE ====================
-interface ReviewResult {
-  score: number;
-  issues: string[];
-  criticalIssues: string[];
-}
-
-async function reviewCode(code: string, taskContent: string, requirements: string[]): Promise<ReviewResult> {
-  const response = await geminiChat([
-    { 
-      role: 'user', 
-      content: `Ты — QA Engineer. Проверь код на РАБОТОСПОСОБНОСТЬ.
-
-ПРОВЕРЬ КАЖДОЕ:
-1. Полнота — функции дописаны? скобки закрыты? return есть?
-2. Синтаксис — импорты есть? отступы правильные?
-3. Логика — код делает что нужно?
-4. ТЗ — требования выполнены?
-
-Шкала:
-9-10: Код запустится и работает
-7-8: Код запустится, мелкие недочёты
-5-6: Код не запустится, нужны исправления
-0-4: Код сломан
-
-ФОРМАТ JSON:
-{
-  "score": 7,
-  "issues": ["проблема 1", "проблема 2"],
-  "criticalIssues": ["критическая проблема которая сломает запуск"]
-}
-
-ЗАДАНИЕ:
-${taskContent.substring(0, 2000)}
-
-ТРЕБОВАНИЯ:
-${requirements.join('\n') || 'Стандартные'}
-
-КОД:
-${code.substring(0, 15000)}
-
-Проверь и оцени.`
-    }
-  ]);
-
-  try {
-    const match = response.match(/\{[\s\S]*\}/);
-    if (match) {
-      const p = JSON.parse(match[0]);
-      return { 
-        score: p.score ?? 5, 
-        issues: p.issues ?? [], 
-        criticalIssues: p.criticalIssues ?? [] 
-      };
-    }
-  } catch {}
+  // 4. Генерируем код
+  await sendMessage(chatId, `🤖 <b>Генерирую код...</b> (${analysis.taskType})`);
+  const genResult = await aiRequest('generate', {
+    taskContent: content,
+    taskType: analysis.taskType,
+    requirements: analysis.requirements || [],
+    exampleCode: similarSuccess?.code
+  });
   
-  return { score: 5, issues: ['Не удалось распарсить'], criticalIssues: [] };
-}
-
-// ==================== FIX CODE ====================
-async function fixCode(
-  code: string, 
-  issues: string[], 
-  criticalIssues: string[],
-  taskContent: string, 
-  requirements: string[],
-  attempt: number,
-  previousAttempts: ReviewResult[]
-): Promise<string> {
-  const allProblems = [...criticalIssues, ...issues].slice(0, 10);
-  const problemsList = allProblems.map((p, i) => `${i+1}. ${p}`).join('\n');
+  if (!genResult?.code) {
+    await sendMessage(chatId, '❌ Не удалось сгенерировать');
+    return;
+  }
   
-  const historyHint = previousAttempts.length > 0
-    ? `\n\nИСТОРИЯ ПОПЫТОК:\n${previousAttempts.map((a, i) => `Попытка ${i+1}: ${a.score}/10, критических: ${a.criticalIssues.length}`).join('\n')}`
-    : '';
+  let code = genResult.code;
   
-  return await geminiChat([
-    { 
-      role: 'user', 
-      content: `Ты — Senior Python Developer. ИСПРАВЬ код.
-
-КРИТИЧНО:
-1. Сохрани структуру кода
-2. Исправь ТОЛЬКО перечисленные проблемы
-3. ПРОВЕРЬ что после исправлений:
-   - Все def имеют тело и return
-   - Все скобки () [] {} сбалансированы
-   - Все try имеют except
-   - Все классы закрыты
-4. НЕ добавляй новый функционал
-5. НЕ переписывай работающие части
-
-Если функция обрывается — ДОПИШИ её полностью.
-Если не хватает импорта — ДОБАВЬ.
-
-ФОРМАТ:
-\`\`\`python
-# ИСПРАВЛЕННЫЙ код
-...
-\`\`\`
-
-ЗАДАНИЕ:
-${taskContent.substring(0, 1500)}
-
-ПРОБЛЕМЫ:
-${problemsList}
-
-КОД:
-${code.substring(0, 15000)}
-
----
-Попытка ${attempt}/${MAX_FIX_ATTEMPTS}${historyHint}
-
-Исправь проблемы и проверь что код целый.`
+  // 5. Проверяем и исправляем
+  let review = await aiRequest('review', { code, taskContent: content, requirements: analysis.requirements || [] });
+  if (!review) review = { score: 5, issues: [], criticalIssues: [] };
+  
+  const reviewHistory: Array<{ score: number; issues: string[]; criticalIssues: string[] }> = [];
+  
+  log('INFO', `Review 1`, { score: review.score, critical: review.criticalIssues?.length });
+  await sendMessage(chatId, `📊 <b>Проверка: ${review.score}/10</b>${review.criticalIssues?.length > 0 ? ` (${review.criticalIssues.length} критических)` : ''}`);
+  
+  let attempt = 0;
+  let bestCode = code;
+  let bestReview = review;
+  
+  while (review.score < MIN_SCORE && attempt < MAX_FIX_ATTEMPTS) {
+    attempt++;
+    await sendMessage(chatId, `🔧 Исправляю... (${attempt}/${MAX_FIX_ATTEMPTS})`);
+    
+    const oldCode = code;
+    reviewHistory.push(review);
+    
+    const fixResult = await aiRequest('fix', {
+      code,
+      issues: review.issues || [],
+      criticalIssues: review.criticalIssues || [],
+      taskContent: content,
+      attempt
+    });
+    
+    if (!fixResult?.code || fixResult.code.length < 50) {
+      log('ERROR', 'Fix returned empty code');
+      code = oldCode;
+      break;
     }
-  ]);
+    
+    code = fixResult.code;
+    
+    review = await aiRequest('review', { code, taskContent: content, requirements: analysis.requirements || [] });
+    if (!review) review = { score: 5, issues: [], criticalIssues: [] };
+    
+    log('INFO', `Review ${attempt + 1}`, { score: review.score, critical: review.criticalIssues?.length });
+    await sendMessage(chatId, `📊 <b>Проверка: ${review.score}/10</b>${review.criticalIssues?.length > 0 ? ` (${review.criticalIssues.length} критических)` : ''}`);
+    
+    if (review.score > bestReview.score || 
+        (review.score === bestReview.score && (review.criticalIssues?.length || 0) < (bestReview.criticalIssues?.length || 0))) {
+      bestCode = code;
+      bestReview = review;
+    }
+    
+    if (review.score < bestReview.score - 2) {
+      log('WARN', 'Score dropped significantly, reverting');
+      code = bestCode;
+      review = bestReview;
+      break;
+    }
+    
+    if (attempt >= 2 && reviewHistory.length >= 2) {
+      const last2 = reviewHistory.slice(-2);
+      if (last2[0].score === review.score && last2[1].score === review.score) {
+        log('WARN', 'No progress for 2 attempts, stopping');
+        break;
+      }
+    }
+  }
+  
+  code = bestCode;
+  review = bestReview;
+  
+  // 6. Сохраняем в обучение
+  const entry: LearningEntry = {
+    id: taskId,
+    taskType: analysis.taskType,
+    description: content.substring(0, 500),
+    code: code.substring(0, 5000),
+    score: review.score,
+    issues: review.issues || [],
+    success: review.score >= MIN_SCORE,
+    createdAt: new Date().toISOString()
+  };
+  addLearningEntry(entry);
+  
+  // 7. Отправляем результат
+  const emoji = review.score >= 9 ? '✅' : review.score >= 7 ? '👍' : '⚠️';
+  await sendMessage(chatId, `${emoji} <b>Результат: ${review.score}/10</b>${attempt > 0 ? ` (${attempt} исправлений)` : ''}${review.score < MIN_SCORE ? '\n\n⚠️ Код требует доработки' : ''}`);
+  
+  const files = extractFiles(code);
+  if (files.size === 0) {
+    await sendMessage(chatId, '❌ Нет файлов');
+    return;
+  }
+  
+  for (const [name, fileContent] of files) {
+    await sendDocument(chatId, fileContent, name);
+    await new Promise(r => setTimeout(r, 300));
+  }
+  
+  log('INFO', `Completed`, { 
+    taskId,
+    score: review.score, 
+    attempts: attempt, 
+    files: files.size, 
+    duration: `${Math.round((Date.now()-startTime)/1000)}s` 
+  });
 }
 
 // ==================== EXTRACT FILES ====================
@@ -509,138 +377,10 @@ function extractFiles(text: string): Map<string, string> {
   return files;
 }
 
-// ==================== PROCESS TASK ====================
-async function processTask(chatId: number, urlOrContent: string, isUrl: boolean) {
-  const startTime = Date.now();
-  const taskId = `task_${Date.now()}`;
-  log('INFO', `Task started`, { taskId, chatId, isUrl });
-  
-  let content = urlOrContent;
-  
-  if (isUrl) {
-    await sendMessage(chatId, '📖 <b>Читаю задание...</b>');
-    content = await readPage(urlOrContent);
-    if (!content) {
-      await sendMessage(chatId, '❌ Не удалось прочитать страницу');
-      return;
-    }
-  }
-  
-  await sendMessage(chatId, '🔍 <b>Анализирую...</b>');
-  const analysis = await analyzeTask(content);
-  log('INFO', `Analyzed`, { canDo: analysis.canDo, type: analysis.taskType, reqs: analysis.requirements.length });
-  
-  if (!analysis.canDo) {
-    await sendMessage(chatId, `⚠️ Не могу выполнить: ${analysis.reason}`);
-    return;
-  }
-  
-  const similarSuccess = getSimilarSuccess(analysis.taskType, content);
-  if (similarSuccess) {
-    await sendMessage(chatId, '📚 <b>Нашёл похожее успешное решение</b> — адаптирую');
-  }
-  
-  await sendMessage(chatId, `🤖 <b>Генерирую код...</b> (${analysis.taskType})`);
-  let code = await generateCode(content, analysis.taskType, analysis.requirements, similarSuccess);
-  
-  if (!code) {
-    await sendMessage(chatId, '❌ Не удалось сгенерировать');
-    return;
-  }
-  
-  let review = await reviewCode(code, content, analysis.requirements);
-  const reviewHistory: ReviewResult[] = [];
-  
-  log('INFO', `Review 1`, { score: review.score, critical: review.criticalIssues.length });
-  await sendMessage(chatId, `📊 <b>Проверка: ${review.score}/10</b>${review.criticalIssues.length > 0 ? ` (${review.criticalIssues.length} критических)` : ''}`);
-  
-  let attempt = 0;
-  let bestCode = code;
-  let bestReview = review;
-  
-  while (review.score < MIN_SCORE && attempt < MAX_FIX_ATTEMPTS) {
-    attempt++;
-    await sendMessage(chatId, `🔧 Исправляю... (${attempt}/${MAX_FIX_ATTEMPTS})`);
-    
-    const oldCode = code;
-    reviewHistory.push(review);
-    
-    code = await fixCode(code, review.issues, review.criticalIssues, content, analysis.requirements, attempt, reviewHistory);
-    
-    if (!code || code.length < 50) {
-      log('ERROR', 'Fix returned empty code');
-      code = oldCode;
-      break;
-    }
-    
-    review = await reviewCode(code, content, analysis.requirements);
-    log('INFO', `Review ${attempt + 1}`, { score: review.score, critical: review.criticalIssues.length });
-    
-    await sendMessage(chatId, `📊 <b>Проверка: ${review.score}/10</b>${review.criticalIssues.length > 0 ? ` (${review.criticalIssues.length} критических)` : ''}`);
-    
-    if (review.score > bestReview.score || 
-        (review.score === bestReview.score && review.criticalIssues.length < bestReview.criticalIssues.length)) {
-      bestCode = code;
-      bestReview = review;
-    }
-    
-    if (review.score < bestReview.score - 2) {
-      log('WARN', 'Score dropped significantly, reverting');
-      code = bestCode;
-      review = bestReview;
-      break;
-    }
-    
-    if (attempt >= 2 && reviewHistory.length >= 2) {
-      const last2 = reviewHistory.slice(-2);
-      if (last2[0].score === review.score && last2[1].score === review.score) {
-        log('WARN', 'No progress for 2 attempts, stopping');
-        break;
-      }
-    }
-  }
-  
-  code = bestCode;
-  review = bestReview;
-  
-  const entry: LearningEntry = {
-    id: taskId,
-    taskType: analysis.taskType,
-    description: content.substring(0, 500),
-    code: code.substring(0, 5000),
-    score: review.score,
-    issues: review.issues,
-    success: review.score >= MIN_SCORE,
-    createdAt: new Date().toISOString()
-  };
-  addLearningEntry(entry);
-  
-  const emoji = review.score >= 9 ? '✅' : review.score >= 7 ? '👍' : '⚠️';
-  await sendMessage(chatId, `${emoji} <b>Результат: ${review.score}/10</b>${attempt > 0 ? ` (${attempt} исправлений)` : ''}${review.score < MIN_SCORE ? '\n\n⚠️ Код требует доработки' : ''}`);
-  
-  const files = extractFiles(code);
-  if (files.size === 0) {
-    await sendMessage(chatId, '❌ Нет файлов');
-    return;
-  }
-  
-  for (const [name, content] of files) {
-    await sendDocument(chatId, content, name);
-    await new Promise(r => setTimeout(r, 300));
-  }
-  
-  log('INFO', `Completed`, { 
-    taskId,
-    score: review.score, 
-    attempts: attempt, 
-    files: files.size, 
-    duration: `${Math.round((Date.now()-startTime)/1000)}s` 
-  });
-}
-
 // ==================== MAIN ====================
 async function main() {
-  log('INFO', '🤖 Freelance Bot v5.3 (Google Gemini) starting...');
+  log('INFO', '🤖 Freelance Bot v6.0 (Remote AI) starting...');
+  log('INFO', `AI API: ${AI_API_URL}`);
   
   const learning = loadLearning();
   log('INFO', `Learning data loaded`, { successes: learning.successes.length, failures: learning.failures.length });
@@ -677,8 +417,8 @@ async function main() {
             
             if (text === '/start') {
               await sendMessage(chat.id, `
-👋 <b>Freelance AI Bot v5.3</b>
-Powered by Google Gemini ✨
+👋 <b>Freelance AI Bot v6.0</b>
+Powered by ZAI 🧠
 
 <b>Как работает:</b>
 1. Анализирую задание
